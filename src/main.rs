@@ -1,66 +1,79 @@
-use std::{
-    collections::HashMap,
-    fs::read_to_string,
-    io::{BufRead, BufReader, Write},
-    net::{TcpListener, TcpStream},
-    sync::{Arc, Mutex},
-    thread,
-    time::Duration,
-};
+use std::io;
+use std::sync::Arc;
+use std::sync::mpsc::{channel, sync_channel};
 
-use parallel_webserver::ThreadPool;
+use parallel_webserver::{CancellableTcpListner, Handler, Statistics, ThreadPool};
 
-fn main() {
-    let cache: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
-    let count = Arc::new(Mutex::new(0));
-    let cache_hit = Arc::new(Mutex::new(0));
-    let tcp = TcpListener::bind("127.0.0.1:7878").unwrap();
-    let pool = ThreadPool::new(5);
+const ADDR: &str = "localhost:7878";
 
-    for stream in tcp.incoming() {
-        let cachee = Arc::clone(&cache);
-        let countee = Arc::clone(&count);
-        let hits = Arc::clone(&cache_hit);
-        pool.execute(|| {
-            handle_connection(stream.unwrap(), cachee, countee, hits);
-        });
+fn main() -> io::Result<()> {
+    // Use a browser that doesn't cache too eagerly so that request is always sent. For example,
+    // Firefox works well.  If you want to test using command line only, use curl. If you want to
+    // run it on the lab server, you may need to change the port number to something else.
+    println!("Run `curl http://{ADDR}/KEY` to query the server with KEY");
 
-        println!("Request count is  {:?}", count.lock().unwrap());
+    // The thread pool.
+    //
+    // In the thread pool, we'll execute:
+    //
+    // - A listener: it accepts incoming connections, and creates a new worker for each connection.
+    //
+    // - Workers (once for each incoming connection): a worker handles an incoming connection and
+    //   sends a corresponding report to the reporter.
+    //
+    // - A reporter: it aggregates the reports from the workers and processes the statistics. When
+    //   it ends, it sends the statistics to the main thread.
+    let pool = Arc::new(ThreadPool::new(7));
 
-        println!("Cache Hit  is  {:?}", cache_hit.lock().unwrap());
-    }
-}
+    // The (MPSC) channel of reports between workers and the reporter.
+    let (report_sender, report_receiver) = channel();
 
-fn handle_connection(
-    mut stream: TcpStream,
-    cache: Arc<Mutex<HashMap<String, String>>>,
-    count: Arc<Mutex<usize>>,
-    hits: Arc<Mutex<usize>>,
-) {
-    let bufreader = BufReader::new(&stream);
-    let a = bufreader.lines().next().unwrap().unwrap();
-    let (requst_format, filename) = match a.as_str() {
-        "GET / HTTP/1.1" => ("HTTP/1.1 200 OK", "hello.html"),
-        "GET /sleep HTTP/1.1" => {
-            thread::sleep(Duration::from_secs(3));
-            ("HTTP/1.1 200 OK", "hello.html")
+    // The (SPSC one-shot) channel of stats between the reporter and the main thread.
+    let (stat_sender, stat_receiver) = sync_channel(0);
+
+    // Listens to the address.
+    let listener = Arc::new(CancellableTcpListner::bind(ADDR)?);
+
+    // Installs a Ctrl-C handler.
+    let ctrlc_listener_handle = listener.clone();
+    ctrlc::set_handler(move || {
+        ctrlc_listener_handle.cancel().unwrap();
+    })
+    .expect("Error setting Ctrl-C handler");
+
+    // Executes the listener.
+    let listener_pool = pool.clone();
+    pool.execute(move || {
+        // Creates the request handler.
+        let handler = Handler::default(); // For each incoming connection...
+        for (id, stream) in listener.incoming().enumerate() {
+            // send a job to the thread pool.
+            let report_sender = report_sender.clone();
+            let handler = handler.clone();
+            listener_pool.execute(move || {
+                let report = handler.handle_conn(id, stream.unwrap());
+                report_sender.send(report).unwrap();
+            });
         }
-        _ => ("HTTP/1.1 404 NOT_FOUND ", "notfound.html"),
-    };
+    });
 
-    let content = {
-        let mut cache_cloned = cache.lock().unwrap();
-        if let Some(cached) = cache_cloned.get(filename) {
-            *hits.lock().unwrap() += 1;
-            cached.clone()
-        } else {
-            cache_cloned.insert(filename.to_string(), read_to_string(filename).unwrap());
-            read_to_string(filename).unwrap()
+    // Executes the reporter.
+    pool.execute(move || {
+        let mut stats = Statistics::default();
+        for report in report_receiver {
+            println!("[report] {report:?}");
+            stats.add_report(report);
         }
-    };
 
-    let len = content.len();
-    let resp_format = format!("{requst_format}\r\nContent-Length:{len}\r\n\r\n{content}");
-    stream.write_all(resp_format.as_bytes()).unwrap();
-    *count.lock().unwrap() += 1;
+        println!("[sending stat]");
+        stat_sender.send(stats).unwrap();
+        println!("[sent stat]");
+    });
+
+    // Blocks until the reporter sends the statistics.
+    let stat = stat_receiver.recv().unwrap();
+    println!("[stat] {stat:?}");
+
+    Ok(())
+    // When the pool is dropped, all worker threads are joined.
 }

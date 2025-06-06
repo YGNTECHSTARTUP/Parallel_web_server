@@ -4,4 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+crossbeam = "0.8.4"
 ctrlc = "3.4"
+regex = "1.11.1"
